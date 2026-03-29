@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="NetGuard - Smart Firewall & Intrusion Detection System with real-time AI-based threat detection using Rule-Based, XGBoost, and Isolation Forest models.">
+    <title>NetGuard | Smart Firewall & IDS Dashboard</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <!-- Socket.IO Client -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+    <!-- Styles -->
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔥</text></svg>">
+</head>
+<body>
+
+<div class="app-container">
+
+    <!-- ===================== Top Navigation ===================== -->
+    <nav class="top-nav">
+        <div class="nav-brand">
+            <div class="nav-logo">🔥</div>
+            <div>
+                <div class="nav-title">NetGuard</div>
+                <div class="nav-subtitle">Smart Firewall & Intrusion Detection System</div>
+            </div>
+        </div>
+
+        <div class="nav-controls">
+            <div class="live-pulse">LIVE</div>
+            <div id="connectionStatus" class="nav-status">
+                <span class="status-dot"></span> Live
+            </div>
+            <span class="nav-time" id="navClock">--:--:--</span>
+            <button id="captureToggle" class="btn btn-danger">⏹ Stop Capture</button>
+        </div>
+    </nav>
+
+    <!-- ===================== Main Content ===================== -->
+    <main class="main-content">
+
+        <!-- Tab Navigation -->
+        <div class="tab-nav">
+            <button class="tab-btn active" data-tab="overview">📊 Overview</button>
+            <button class="tab-btn" data-tab="packets">📦 Packets</button>
+            <button class="tab-btn" data-tab="alerts">
+                🚨 Alerts
+                <span id="alertBadge" class="tab-badge" style="display: none">0</span>
+            </button>
+            <button class="tab-btn" data-tab="normal">
+                ✅ Normal Traffic
+            </button>
+            <button class="tab-btn" data-tab="firewall">
+                🔥 Firewall
+                <span id="firewallBadge" class="tab-badge firewall-badge" style="display: none">0</span>
+            </button>
+            <button class="tab-btn" data-tab="flows">🔄 Flows</button>
+            <button class="tab-btn" data-tab="detection">🧠 Detection Engine</button>
+        </div>
+
+        <!-- ===================== Overview Tab ===================== -->
+        <div id="tab-overview" class="tab-content active">
+
+            <!-- Stats Cards -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon">📦</div>
+                    <div class="stat-label">Total Packets</div>
+                    <div class="stat-value accent" id="stat-total-packets">0</div>
+                    <div class="stat-change" id="stat-pps">0 pps</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-label">Data Transferred</div>
+                    <div class="stat-value" id="stat-total-bytes">0 B</div>
+                    <div class="stat-change" id="stat-bps">0 B/s</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🔒</div>
+                    <div class="stat-label">Encrypted Packets</div>
+                    <div class="stat-value" id="stat-encrypted">0</div>
+                    <div class="stat-change">Without payload inspection</div>
+                </div>
+                <div class="stat-card" id="alert-stat-card">
+                    <div class="stat-icon">🚨</div>
+                    <div class="stat-label">Alerts</div>
+                    <div class="stat-value" id="stat-alerts">0</div>
+                    <div class="stat-change" id="stat-alerts-breakdown">Rule: 0 | ML: 0 | Hybrid: 0</div>
+                </div>
+                <div class="stat-card" id="normal-stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-label">Clean Packets</div>
+                    <div class="stat-value" id="stat-clean-packets" style="color: var(--accent-success);">0</div>
+                    <div class="stat-change" id="stat-clean-ips">0 safe IPs</div>
+                </div>
+                <div class="stat-card" id="firewall-stat-card">
+                    <div class="stat-icon">🔥</div>
+                    <div class="stat-label">Blocked IPs</div>
+                    <div class="stat-value" id="stat-blocked-ips">0</div>
+                    <div class="stat-change" id="stat-flagged-ips">0 flagged</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🔄</div>
+                    <div class="stat-label">Active Flows</div>
+                    <div class="stat-value" id="stat-active-flows">0</div>
+                    <div class="stat-change">Bidirectional tracking</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⏱️</div>
+                    <div class="stat-label">Uptime</div>
+                    <div class="stat-value" id="stat-uptime">0s</div>
+                    <div class="stat-change">Capture duration</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚖️</div>
+                    <div class="stat-label">Decisions</div>
+                    <div class="stat-value" id="stat-total-decisions">0</div>
+                    <div class="stat-change" id="stat-decision-breakdown">BLOCK: 0 | FLAG: 0 | ALLOW: 0</div>
+                </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <h3><span class="icon">📈</span> Traffic Timeline</h3>
+                    <div class="chart-container">
+                        <canvas id="trafficChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <h3><span class="icon">🔵</span> Protocol Distribution</h3>
+                    <div class="chart-container">
+                        <canvas id="protocolChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent Alerts Preview -->
+            <div class="table-container" style="margin-bottom: 1.5rem;">
+                <div class="table-header">
+                    <h3>🚨 Recent Alerts</h3>
+                    <span class="live-pulse">LIVE</span>
+                </div>
+                <div id="overviewAlerts" style="padding: 0.5rem;">
+                    <div class="empty-state" style="padding: 2rem;">
+                        <div class="icon">🛡️</div>
+                        <p>Monitoring... No threats detected yet.</p>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- ===================== Packets Tab ===================== -->
+        <div id="tab-packets" class="tab-content">
+            <div class="table-container">
+                <div class="table-header">
+                    <h3>📦 Live Packet Stream</h3>
+                    <div class="table-controls">
+                        <input type="text" id="packetSearch" class="table-search"
+                               placeholder="Filter by IP, port, protocol...">
+                        <span class="live-pulse">LIVE</span>
+                    </div>
+                </div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Source IP</th>
+                                <th>Src Port</th>
+                                <th>Destination IP</th>
+                                <th>Dst Port</th>
+                                <th>Protocol</th>
+                                <th>Length</th>
+                                <th>Flags</th>
+                                <th>Enc</th>
+                            </tr>
+                        </thead>
+                        <tbody id="packetTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===================== Alerts Tab ===================== -->
+        <div id="tab-alerts" class="tab-content">
+            <!-- Filter Bar -->
+            <div class="filter-bar">
+                <span style="font-size: 0.8rem; color: var(--text-muted); margin-right: 8px;">Severity:</span>
+                <button class="filter-chip active" data-filter="all">All</button>
+                <button class="filter-chip" data-filter="critical">🔴 Critical</button>
+                <button class="filter-chip" data-filter="high">🟠 High</button>
+                <button class="filter-chip" data-filter="medium">🟣 Medium</button>
+                <button class="filter-chip" data-filter="low">🔵 Low</button>
+                <span style="font-size: 0.8rem; color: var(--text-muted); margin-left: 16px; margin-right: 8px;">Method:</span>
+                <button class="filter-chip method-filter active" data-method="all">All</button>
+                <button class="filter-chip method-filter" data-method="rule-based">📋 Rule</button>
+                <button class="filter-chip method-filter" data-method="machine-learning">🤖 ML</button>
+                <button class="filter-chip method-filter" data-method="hybrid">⚡ Hybrid</button>
+            </div>
+
+            <!-- Charts Row -->
+            <div class="charts-grid" style="margin-bottom: 1rem;">
+                <div class="chart-card">
+                    <h3><span class="icon">📊</span> Alert Severity Distribution</h3>
+                    <div class="chart-container" style="height: 220px;">
+                        <canvas id="severityChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-card">
+                    <h3><span class="icon">🎯</span> Attack Types</h3>
+                    <div class="chart-container" style="height: 220px;">
+                        <canvas id="attackTypeChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Alerts List -->
+            <div id="alertsList">
+                <div class="empty-state">
+                    <div class="icon">🛡️</div>
+                    <p>No alerts detected. Network appears clean.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===================== Normal Traffic Tab ===================== -->
+        <div id="tab-normal" class="tab-content">
+
+            <!-- Normal Traffic Stats -->
+            <div class="stats-grid" style="grid-template-columns: repeat(4, 1fr);">
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-label">Clean Packets</div>
+                    <div class="stat-value" id="normal-total-packets" style="color: var(--accent-success);">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-label">Clean Data</div>
+                    <div class="stat-value" id="normal-total-bytes">0 B</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🌐</div>
+                    <div class="stat-label">Safe Unique IPs</div>
+                    <div class="stat-value" id="normal-unique-ips">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📈</div>
+                    <div class="stat-label">Clean Traffic Ratio</div>
+                    <div class="stat-value" id="normal-ratio">100%</div>
+                </div>
+            </div>
+
+            <div class="charts-grid">
+                <!-- Clean Protocol Breakdown -->
+                <div class="chart-card">
+                    <h3><span class="icon">🔵</span> Clean Protocol Breakdown</h3>
+                    <div class="chart-container" style="height: 260px;">
+                        <canvas id="normalProtocolChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Top Safe IPs -->
+                <div class="chart-card">
+                    <h3><span class="icon">🛡️</span> Top Safe IPs (Benign Traffic)</h3>
+                    <div id="safeIpsList" style="padding: 0.5rem;">
+                        <div class="empty-state" style="padding: 2rem;">
+                            <div class="icon">⏳</div>
+                            <p>Collecting normal traffic data...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Info box -->
+            <div class="chart-card" style="margin-top: 1rem;">
+                <h3><span class="icon">ℹ️</span> About Normal Traffic</h3>
+                <div style="padding: 1rem; font-size: 0.85rem; color: var(--text-secondary); line-height: 1.8;">
+                    <p>This section shows traffic that has been analyzed by <strong style="color: var(--text-primary);">both the Rule-Based engine and the ML model</strong> and was determined to be <strong style="color: var(--accent-success);">safe and benign</strong>.</p>
+                    <br>
+                    <p>✅ <strong style="color: var(--accent-success);">Clean packets</strong> = Packets that passed through all detection rules and ML classification without triggering any alerts.</p>
+                    <p>🛡️ <strong style="color: var(--text-primary);">Safe IPs</strong> = Source IPs that have only generated clean traffic with no associated threat detections.</p>
+                    <br>
+                    <p style="color: var(--text-muted);">A high clean-to-alert ratio indicates a healthy network. A declining ratio may indicate increased attack activity.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===================== Firewall Tab ===================== -->
+        <div id="tab-firewall" class="tab-content">
+
+            <!-- Firewall Stats -->
+            <div class="stats-grid" style="grid-template-columns: repeat(4, 1fr);">
+                <div class="stat-card">
+                    <div class="stat-icon">🚫</div>
+                    <div class="stat-label">Total Blocked</div>
+                    <div class="stat-value accent" id="fw-total-blocked">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚠️</div>
+                    <div class="stat-label">Total Flagged</div>
+                    <div class="stat-value" id="fw-total-flagged">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">✅</div>
+                    <div class="stat-label">Total Allowed</div>
+                    <div class="stat-value" id="fw-total-allowed">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-label">Active Blocks</div>
+                    <div class="stat-value" id="fw-active-blocks">0</div>
+                </div>
+            </div>
+
+            <div class="charts-grid">
+                <!-- Blocked IPs -->
+                <div class="chart-card">
+                    <h3><span class="icon">🚫</span> Currently Blocked IPs</h3>
+                    <div id="blockedIpsList" style="padding: 0.5rem;">
+                        <div class="empty-state" style="padding: 2rem;">
+                            <div class="icon">✅</div>
+                            <p>No IPs currently blocked.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Flagged IPs -->
+                <div class="chart-card">
+                    <h3><span class="icon">⚠️</span> Flagged (Suspicious) IPs</h3>
+                    <div id="flaggedIpsList" style="padding: 0.5rem;">
+                        <div class="empty-state" style="padding: 2rem;">
+                            <div class="icon">🟢</div>
+                            <p>No IPs currently flagged.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Decision Log -->
+            <div class="table-container" style="margin-top: 1rem;">
+                <div class="table-header">
+                    <h3>📋 Recent Firewall Decisions</h3>
+                    <span class="live-pulse">LIVE</span>
+                </div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Action</th>
+                                <th>Source IP</th>
+                                <th>Target IP</th>
+                                <th>Attack Type</th>
+                                <th>Severity</th>
+                                <th>Confidence</th>
+                                <th>Rule</th>
+                                <th>ML</th>
+                            </tr>
+                        </thead>
+                        <tbody id="decisionTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===================== Flows Tab ===================== -->
+        <div id="tab-flows" class="tab-content">
+            <div class="table-container">
+                <div class="table-header">
+                    <h3>🔄 Active Network Flows</h3>
+                    <span class="live-pulse">LIVE</span>
+                </div>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Source</th>
+                                <th>Destination</th>
+                                <th>Protocol</th>
+                                <th>Packets</th>
+                                <th>Bytes</th>
+                                <th>Duration</th>
+                                <th>PPS</th>
+                                <th>Encrypted</th>
+                            </tr>
+                        </thead>
+                        <tbody id="flowsTableBody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ===================== Detection Engine Tab ===================== -->
+        <div id="tab-detection" class="tab-content">
+
+            <!-- ML Status -->
+            <div class="ml-status">
+                <h3>🧠 Machine Learning Engine</h3>
+                <div class="ml-info-grid">
+                    <div class="ml-info-item">
+                        <div class="ml-info-label">Status</div>
+                        <div class="ml-info-value" id="ml-status-text">Initializing...</div>
+                    </div>
+                    <div class="ml-info-item">
+                        <div class="ml-info-label">Training Samples</div>
+                        <div class="ml-info-value" id="ml-samples">0 / 100</div>
+                    </div>
+                    <div class="ml-info-item">
+                        <div class="ml-info-label">Anomalies Detected</div>
+                        <div class="ml-info-value" id="ml-anomalies">0</div>
+                    </div>
+                    <div class="ml-info-item">
+                        <div class="ml-info-label">Model Quality</div>
+                        <div class="ml-info-value" id="ml-accuracy">N/A</div>
+                    </div>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="ml-progress-fill" style="width: 0%"></div>
+                </div>
+                <div style="margin-top: 1rem; text-align: right;">
+                    <button id="retrainBtn" class="btn btn-outline btn-sm">🔄 Retrain Model</button>
+                </div>
+            </div>
+
+            <!-- Detection Rules Summary -->
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <h3><span class="icon">📋</span> Active Detection Rules</h3>
+                    <div style="padding: 0.5rem;">
+                        <table style="width: 100%;">
+                            <thead>
+                                <tr>
+                                    <th>Rule</th>
+                                    <th>Type</th>
+                                    <th>Severity</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td style="color: var(--text-primary);">DDoS Detection</td>
+                                    <td>Volumetric Attack</td>
+                                    <td><span class="severity-badge severity-critical">CRITICAL</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">Port Scan Detection</td>
+                                    <td>Network Recon</td>
+                                    <td><span class="severity-badge severity-high">HIGH</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">SYN Flood Detection</td>
+                                    <td>DoS Attack</td>
+                                    <td><span class="severity-badge severity-critical">CRITICAL</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">SQL Injection</td>
+                                    <td>Web Attack</td>
+                                    <td><span class="severity-badge severity-critical">CRITICAL</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">Brute Force</td>
+                                    <td>Auth Attack</td>
+                                    <td><span class="severity-badge severity-high">HIGH</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">DNS Tunneling</td>
+                                    <td>Data Exfiltration</td>
+                                    <td><span class="severity-badge severity-high">HIGH</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">ICMP Flood</td>
+                                    <td>DoS Attack</td>
+                                    <td><span class="severity-badge severity-medium">MEDIUM</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">ARP Spoofing</td>
+                                    <td>MITM Attack</td>
+                                    <td><span class="severity-badge severity-critical">CRITICAL</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">Encrypted Anomaly</td>
+                                    <td>TLS Analysis</td>
+                                    <td><span class="severity-badge severity-medium">MEDIUM</span></td>
+                                    <td style="color: var(--accent-success);">● Active</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">ML Anomaly Detection</td>
+                                    <td>Behavioral</td>
+                                    <td><span class="severity-badge severity-high">HIGH</span></td>
+                                    <td id="ml-rule-status" style="color: var(--accent-warning);">⏳ Learning</td>
+                                </tr>
+                                <tr>
+                                    <td style="color: var(--text-primary);">XGBoost Classifier</td>
+                                    <td>AI Classification</td>
+                                    <td><span class="severity-badge severity-critical">CRITICAL</span></td>
+                                    <td id="xgb-rule-status" style="color: var(--accent-warning);">⏳ Loading</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="chart-card">
+                    <h3><span class="icon">ℹ️</span> System Architecture</h3>
+                    <div style="padding: 1rem; font-size: 0.82rem; color: var(--text-secondary); line-height: 1.8;">
+                        <p><strong style="color: var(--text-primary);">Smart Firewall & IDS Architecture</strong></p>
+                        <p>This system uses a hybrid approach for threat detection:</p>
+                        <br>
+                        <p>🔹 <strong style="color: #818cf8;">Rule-Based Engine</strong><br>
+                           Pattern matching for DDoS, Port Scan, SYN Flood,
+                           SQL Injection, Brute Force, DNS Tunneling.
+                        </p>
+                        <br>
+                        <p>🔹 <strong style="color: #f472b6;">Isolation Forest (Anomaly)</strong><br>
+                           Unsupervised anomaly detection on flow features.
+                           Learns normal behavior and flags deviations.
+                        </p>
+                        <br>
+                        <p>🔹 <strong style="color: #a78bfa;">XGBoost Classifier</strong><br>
+                           Classifies traffic as Normal, DDoS, Ransomware,
+                           APT, SQL Injection, or Brute Force.
+                        </p>
+                        <br>
+                        <p>🔹 <strong style="color: #fbbf24;">Decision Engine</strong><br>
+                           Rule + ML both confirm → <strong style="color: #ef4444;">BLOCK</strong> (auto-firewall)<br>
+                           Single engine detection → <strong style="color: #f59e0b;">FLAG</strong> (manual action)<br>
+                           Repeated FLAGs (×3) → <strong style="color: #ef4444;">Auto-BLOCK</strong><br>
+                           Neither → <strong style="color: #10b981;">ALLOW</strong>
+                        </p>
+                        <br>
+                        <p>🔹 <strong style="color: #34d399;">Telegram Alerts</strong><br>
+                           Sends real-time notifications for HIGH/CRITICAL
+                           severity detections to Telegram.
+                        </p>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </main>
+
+</div>
+
+<!-- Dashboard JavaScript -->
+<script src="/static/js/dashboard.js"></script>
+
+</body>
+</html>
