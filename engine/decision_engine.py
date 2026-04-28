@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 import config
+from detection.rule_engine import _should_skip_ip as _should_skip_detection_ip
 
 # ─── Structured Logger ────────────────────────────────────────
 logger = logging.getLogger('netguard.decision')
@@ -172,24 +173,23 @@ class DecisionEngine:
         """
         pkt_count = self.get_packet_count(source_ip)
 
-        # ─── GATE 0: Safe / whitelisted IP → always ALLOW ─────
-        if _is_safe_ip(source_ip):
+        # ── GATE 0: Skip loopback / broadcast → always ALLOW ──
+        if _should_skip_detection_ip(source_ip):
             self.stats['whitelisted_skips'] += 1
             action = FirewallAction(
                 action=FirewallAction.ALLOW,
-                reason=f'Safe/whitelisted IP — not flagged ({source_ip})',
+                reason=f'Loopback/broadcast IP — not flagged ({source_ip})',
                 source_ip=source_ip,
                 target_ip=target_ip,
                 severity='low',
                 confidence=0.0,
                 packet_count=pkt_count,
                 detection_details=[
-                    f'IP {source_ip} is private/internal or whitelisted',
-                    'Policy: safe IPs are never blocked or flagged',
+                    f'IP {source_ip} is loopback or broadcast',
+                    'Policy: loopback/broadcast IPs are never blocked',
                 ],
             )
-            # Log but do NOT record as a full decision to keep stats clean
-            logger.debug("ALLOW (safe IP): %s", source_ip)
+            logger.debug("ALLOW (skip IP): %s", source_ip)
             return action
 
         # Check if IP is already blocked
@@ -447,9 +447,9 @@ class DecisionEngine:
 
     def _block_ip(self, ip, reason):
         """Add IP to blocked list (simulated firewall)."""
-        # Final safety check — never block safe IPs
-        if _is_safe_ip(ip):
-            logger.warning("REFUSED to block safe IP %s — policy override", ip)
+        # Final safety check — never block loopback/broadcast
+        if _should_skip_detection_ip(ip):
+            logger.warning("REFUSED to block skip IP %s — policy override", ip)
             return
 
         with self._lock:
@@ -466,8 +466,8 @@ class DecisionEngine:
 
     def _flag_ip(self, ip, reason):
         """Add IP to flagged list, auto-block after threshold."""
-        # Never flag safe IPs
-        if _is_safe_ip(ip):
+        # Never flag loopback/broadcast
+        if _should_skip_detection_ip(ip):
             return
 
         with self._lock:

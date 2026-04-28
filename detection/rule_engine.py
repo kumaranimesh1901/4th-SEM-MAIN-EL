@@ -37,6 +37,23 @@ def _is_safe_ip(ip):
     return False
 
 
+def _should_skip_ip(ip):
+    """
+    Safety filter for detection: skip loopback and broadcast/multicast
+    but KEEP private ranges (10.*, 192.168.*) so that LAN scans are caught.
+    """
+    if not ip:
+        return True
+    # Skip loopback
+    if getattr(config, 'IGNORE_LOOPBACK', True) and ip == '127.0.0.1':
+        return True
+    # Skip broadcast / multicast
+    if getattr(config, 'IGNORE_BROADCAST_MULTICAST', True):
+        if ip == '255.255.255.255' or ip.startswith('224.') or ip.startswith('239.'):
+            return True
+    return False
+
+
 class Alert:
     """Represents a security alert with explainable details."""
 
@@ -113,19 +130,27 @@ class RuleBasedDetector:
         self._alert_cooldown = {}
         self._cooldown_seconds = 15
 
+        # ── Rate-based High-Rate Traffic tracker ──────────────
+        self._rate_tracker = defaultdict(lambda: deque(maxlen=2000))
+        self._rate_sustained_start = {}   # src_ip -> first time threshold was exceeded
+
+        # Throttled debug log counter
+        self._debug_log_counter = 0
+
     def register_alert_callback(self, callback):
         """Register callback for new alerts."""
         self._alert_callbacks.append(callback)
 
     def analyze_packet(self, pkt_info, flow=None):
-        """Run all detection rules on a packet. Skips safe IPs."""
-        # Skip safe/internal/whitelisted IPs entirely
-        if _is_safe_ip(pkt_info.src_ip):
+        """Run all detection rules on a packet. Skips loopback/broadcast only."""
+        # Skip loopback & broadcast — but NOT private LAN IPs
+        if _should_skip_ip(pkt_info.src_ip):
             return []
 
         detections = []
+        detections.extend(self._detect_port_scan_v2(pkt_info))
+        detections.extend(self._detect_rate_alert(pkt_info))
         detections.extend(self._detect_ddos(pkt_info))
-        detections.extend(self._detect_port_scan(pkt_info))
         detections.extend(self._detect_syn_flood(pkt_info))
         detections.extend(self._detect_brute_force(pkt_info))
         detections.extend(self._detect_sql_injection(pkt_info))
@@ -315,50 +340,145 @@ class RuleBasedDetector:
 
         return alerts
 
-    # ─── Port Scan Detection ─────────────────────────────────
+    # ─── Port Scan Detection v2 (sliding window, Nmap-aware) ─
 
-    def _detect_port_scan(self, pkt_info):
-        """Detect port scanning activity."""
+    def _detect_port_scan_v2(self, pkt_info):
+        """
+        Detect port scanning using a per-src_ip sliding window.
+        Triggers when >= PORT_SCAN_UNIQUE_PORTS unique dst_ports
+        are seen within PORT_SCAN_WINDOW_SEC seconds.
+        Works for any protocol with a dst_port (not just SYN).
+        """
         alerts = []
-        rules = config.RULES['port_scan']
+        if not pkt_info.dst_port or not pkt_info.src_ip:
+            return alerts
 
-        if pkt_info.protocol in ('TCP', 'HTTP', 'HTTPS') and pkt_info.flags and 'S' in pkt_info.flags:
-            now = time.time()
-            src = pkt_info.src_ip
-            dst = pkt_info.dst_ip
+        now = time.time()
+        src = pkt_info.src_ip
+        dst = pkt_info.dst_ip or ''
+        port = pkt_info.dst_port
 
-            self._port_scan_tracker[src][dst].add(pkt_info.dst_port)
-            self._port_scan_times[src].append(now)
+        window = getattr(config, 'PORT_SCAN_WINDOW_SEC', 5)
+        threshold = getattr(config, 'PORT_SCAN_UNIQUE_PORTS', 20)
 
-            while self._port_scan_times[src] and now - self._port_scan_times[src][0] > rules['time_window']:
-                self._port_scan_times[src].popleft()
+        # Record (timestamp, port)
+        self._port_scan_times[src].append((now, port))
 
-            all_ports = set()
-            for target, ports in self._port_scan_tracker[src].items():
-                all_ports.update(ports)
+        # Evict entries outside the window
+        while (self._port_scan_times[src] and
+               now - self._port_scan_times[src][0][0] > window):
+            self._port_scan_times[src].popleft()
 
-            if len(all_ports) >= rules['threshold']:
-                confidence = min(1.0, len(all_ports) / (rules['threshold'] * 2))
-                targets = list(self._port_scan_tracker[src].keys())
+        # Collect unique ports within the window
+        unique_ports = set(p for _, p in self._port_scan_times[src])
 
-                alert = Alert(
-                    alert_type='Port Scan',
-                    severity=rules['severity'],
-                    source_ip=src,
-                    target_ip=', '.join(targets[:3]),
-                    description=f"Port scan detected from {src}. {len(all_ports)} unique ports probed across {len(targets)} target(s) in {rules['time_window']}s window.",
-                    evidence=[
-                        f"Source IP: {src}",
-                        f"Unique ports scanned: {len(all_ports)}",
-                        f"Threshold: {rules['threshold']} ports",
-                        f"Target hosts: {', '.join(targets[:5])}",
-                        f"Sample ports: {sorted(list(all_ports))[:10]}",
-                        f"All SYN packets (no established connections)",
-                    ],
-                    confidence=confidence,
-                )
-                alerts.append(alert)
-                self._port_scan_tracker[src].clear()
+        # Periodic debug log (every 200 packets per src)
+        self._debug_log_counter += 1
+        if self._debug_log_counter % 200 == 0:
+            logger.debug(
+                "port_scan_v2 src=%s unique_ports=%d/%d window=%ds",
+                src, len(unique_ports), threshold, window,
+            )
+
+        if len(unique_ports) >= threshold:
+            confidence = min(1.0, len(unique_ports) / (threshold * 2))
+            logger.warning(
+                "PORT_SCAN triggered src=%s unique_ports=%d window=%ds",
+                src, len(unique_ports), window,
+            )
+
+            alert = Alert(
+                alert_type='Port Scan',
+                severity='high',
+                source_ip=src,
+                target_ip=dst,
+                description=(
+                    f"Port scan detected from {src}. "
+                    f"{len(unique_ports)} unique ports probed in {window}s window."
+                ),
+                evidence=[
+                    f"Source IP: {src}",
+                    f"Unique ports scanned: {len(unique_ports)}",
+                    f"Threshold: {threshold} ports",
+                    f"Window: {window}s",
+                    f"Sample ports: {sorted(list(unique_ports))[:15]}",
+                ],
+                confidence=confidence,
+            )
+            alerts.append(alert)
+            # Reset tracker for this src after alert
+            self._port_scan_times[src].clear()
+
+        return alerts
+
+    # ─── Rate-based High Rate Traffic Detection ───────────────
+
+    def _detect_rate_alert(self, pkt_info):
+        """
+        Detect high-rate traffic (DDoS / scan fallback).
+        Per src_ip: if >= RATE_PPS_THRESHOLD pps sustained for
+        >= RATE_WINDOW_SEC seconds → alert.
+        """
+        alerts = []
+        if not pkt_info.src_ip:
+            return alerts
+
+        now = time.time()
+        src = pkt_info.src_ip
+        pps_threshold = getattr(config, 'RATE_PPS_THRESHOLD', 100)
+        sustain_sec = getattr(config, 'RATE_WINDOW_SEC', 3)
+
+        self._rate_tracker[src].append(now)
+
+        # Clean entries older than sustain window + 1s buffer
+        while (self._rate_tracker[src] and
+               now - self._rate_tracker[src][0] > sustain_sec + 1):
+            self._rate_tracker[src].popleft()
+
+        count = len(self._rate_tracker[src])
+        elapsed = (now - self._rate_tracker[src][0]) if count > 1 else 0
+        pps = count / max(elapsed, 0.1)
+
+        if pps >= pps_threshold:
+            if src not in self._rate_sustained_start:
+                self._rate_sustained_start[src] = now
+                return alerts  # Start tracking, don't alert yet
+
+            sustained = now - self._rate_sustained_start[src]
+            if sustained < sustain_sec:
+                return alerts  # Not sustained long enough
+
+            # Sustained — generate alert
+            del self._rate_sustained_start[src]
+            confidence = min(1.0, pps / (pps_threshold * 2))
+            logger.warning(
+                "RATE_ALERT triggered src=%s pps=%.0f sustained=%.0fs",
+                src, pps, sustained,
+            )
+
+            alert = Alert(
+                alert_type='High Rate Traffic',
+                severity='high',
+                source_ip=src,
+                target_ip=pkt_info.dst_ip or '',
+                description=(
+                    f"High-rate traffic from {src}. "
+                    f"{pps:.0f} packets/s sustained for {sustained:.0f}s."
+                ),
+                evidence=[
+                    f"Source IP: {src}",
+                    f"Packet rate: {pps:.0f} pps",
+                    f"Threshold: {pps_threshold} pps",
+                    f"Sustained: {sustained:.0f}s (min {sustain_sec}s)",
+                ],
+                confidence=confidence,
+            )
+            alerts.append(alert)
+            self._rate_tracker[src].clear()
+        else:
+            # Rate dropped — reset sustain tracking
+            if src in self._rate_sustained_start:
+                del self._rate_sustained_start[src]
 
         return alerts
 

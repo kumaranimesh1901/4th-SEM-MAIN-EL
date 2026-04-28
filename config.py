@@ -52,6 +52,18 @@ WHITELISTED_IPS = {
 # ============================================================
 ALERT_HISTORY_SIZE = 500  # Max alerts to keep in memory
 DETECTION_WINDOW = 60  # Time window in seconds for flow analysis
+
+# ── Port Scan Detection (sliding window) ──────────────────────
+PORT_SCAN_UNIQUE_PORTS = 20    # Unique dst ports to trigger alert
+PORT_SCAN_WINDOW_SEC = 5       # Sliding window in seconds
+
+# ── Rate-based DDoS / Scan Fallback ───────────────────────────
+RATE_PPS_THRESHOLD = 100       # Packets per second to flag
+RATE_WINDOW_SEC = 3            # Sustain window in seconds
+
+# ── Safety Filters ────────────────────────────────────────────
+IGNORE_LOOPBACK = True         # Skip 127.0.0.1
+IGNORE_BROADCAST_MULTICAST = True  # Skip 255.255.255.255, 224.* etc.
 FLOW_TIMEOUT = 120  # Flow inactivity timeout in seconds
 
 # ============================================================
@@ -161,8 +173,8 @@ RULES = {
 # ============================================================
 FIREWALL = {
     'block_duration': 300,                # Seconds to block an IP (5 minutes)
-    'flag_threshold': 5,                  # Number of FLAG events before auto-BLOCK (raised from 3)
-    'min_ml_confidence': 0.8,             # Minimum ML confidence for decisions (raised from 0.5)
+    'flag_threshold': 1,                  # Number of FLAG events before auto-BLOCK (lowered for demo)
+    'min_ml_confidence': 0.3,             # Minimum ML confidence for decisions (lowered for demo)
     'enable_iptables': False,             # Set True for real iptables integration (Linux only)
     'min_packet_count_before_action': 10, # Minimum packets from an IP before BLOCK/FLAG
 }

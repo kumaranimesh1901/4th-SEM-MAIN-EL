@@ -16,7 +16,7 @@ import time
 import threading
 from collections import deque, defaultdict
 
-from detection.rule_engine import RuleBasedDetector, Alert
+from detection.rule_engine import RuleBasedDetector, Alert, _should_skip_ip
 from detection.ml_detector import MLDetector
 from engine.flow_analyzer import FlowAnalyzer
 from engine.decision_engine import DecisionEngine, _is_safe_ip
@@ -122,8 +122,8 @@ class HybridDetector:
         7. Telegram alerts for high severity
         8. Track normal traffic
         """
-        # Step 0: Skip safe / private / whitelisted IPs entirely
-        if _is_safe_ip(pkt_info.src_ip):
+        # Step 0: Skip loopback / broadcast only (private LAN IPs are processed)
+        if _should_skip_ip(pkt_info.src_ip):
             self._track_normal_traffic(pkt_info)
             return
 
