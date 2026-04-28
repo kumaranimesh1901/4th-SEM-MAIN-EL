@@ -4,7 +4,7 @@ Detects known attack patterns based on packet and flow characteristics.
 Each detection rule provides explainable reasons for alerts.
 
 Attack types detected:
-  - DDoS (high packet rate from same IP)
+  - DDoS (high packet rate from same IP, sustained)
   - Port Scanning (multiple ports accessed quickly)
   - SYN Flood (volumetric SYN-only traffic)
   - Brute Force (repeated login attempts)
@@ -12,15 +12,29 @@ Attack types detected:
   - DNS Tunneling (long queries, high frequency)
   - ICMP Flood (volumetric ICMP traffic)
   - ARP Spoofing (duplicate IP-MAC mappings)
-  - Encrypted Traffic Anomaly (deprecated TLS versions)
+  - Encrypted Traffic Anomaly (deprecated TLS versions, repeated)
 """
 
 import time
+import logging
 import threading
 from collections import defaultdict, deque
 from datetime import datetime
 
 import config
+
+logger = logging.getLogger('netguard.rules')
+
+
+def _is_safe_ip(ip):
+    """Check whether an IP is private/internal or whitelisted."""
+    if not ip:
+        return False
+    if ip.startswith(config.PRIVATE_IP_PREFIXES):
+        return True
+    if ip in config.WHITELISTED_IPS:
+        return True
+    return False
 
 
 class Alert:
@@ -67,6 +81,7 @@ class RuleBasedDetector:
     """
     Detects attacks using predefined rules and heuristics.
     Each detection provides explainable evidence.
+    Safe/private/whitelisted IPs are skipped automatically.
     """
 
     def __init__(self):
@@ -75,24 +90,26 @@ class RuleBasedDetector:
         self._lock = threading.Lock()
 
         # Tracking data structures
-        self._syn_tracker = defaultdict(lambda: deque(maxlen=500))     # IP -> deque of timestamps
-        self._port_scan_tracker = defaultdict(lambda: defaultdict(set))  # src_ip -> {target_ip: {ports}}
+        self._syn_tracker = defaultdict(lambda: deque(maxlen=500))
+        self._port_scan_tracker = defaultdict(lambda: defaultdict(set))
         self._port_scan_times = defaultdict(lambda: deque(maxlen=200))
-        self._dns_tracker = defaultdict(lambda: deque(maxlen=200))     # src_ip -> deque of queries
-        self._icmp_tracker = defaultdict(lambda: deque(maxlen=500))    # target_ip -> timestamps
-        self._arp_table = defaultdict(set)                              # ip -> set of MACs
-        self._brute_force_tracker = defaultdict(lambda: deque(maxlen=100))  # (ip, port) -> timestamps
-        self._transfer_tracker = defaultdict(int)                       # flow_id -> total bytes
-        self._encrypted_tracker = defaultdict(list)                     # src_ip -> list of tls info
+        self._dns_tracker = defaultdict(lambda: deque(maxlen=200))
+        self._icmp_tracker = defaultdict(lambda: deque(maxlen=500))
+        self._arp_table = defaultdict(set)
+        self._arp_timestamps = defaultdict(lambda: deque(maxlen=50))
+        self._brute_force_tracker = defaultdict(lambda: deque(maxlen=100))
+        self._transfer_tracker = defaultdict(int)
+        self._encrypted_tracker = defaultdict(lambda: deque(maxlen=50))
 
-        # DDoS tracker: packets per src_ip
+        # DDoS tracker
         self._ddos_packet_tracker = defaultdict(lambda: deque(maxlen=2000))
         self._ddos_byte_tracker = defaultdict(lambda: deque(maxlen=2000))
+        self._ddos_sustained_start = {}  # src_ip -> first time threshold was exceeded
 
         # SQL Injection tracker
         self._sqli_tracker = defaultdict(lambda: deque(maxlen=100))
 
-        # Cooldown to prevent alert flooding (type+src -> last alert time)
+        # Cooldown to prevent alert flooding
         self._alert_cooldown = {}
         self._cooldown_seconds = 15
 
@@ -101,9 +118,12 @@ class RuleBasedDetector:
         self._alert_callbacks.append(callback)
 
     def analyze_packet(self, pkt_info, flow=None):
-        """Run all detection rules on a packet."""
-        detections = []
+        """Run all detection rules on a packet. Skips safe IPs."""
+        # Skip safe/internal/whitelisted IPs entirely
+        if _is_safe_ip(pkt_info.src_ip):
+            return []
 
+        detections = []
         detections.extend(self._detect_ddos(pkt_info))
         detections.extend(self._detect_port_scan(pkt_info))
         detections.extend(self._detect_syn_flood(pkt_info))
@@ -136,12 +156,13 @@ class RuleBasedDetector:
         self._alert_cooldown[key] = now
         return True
 
-    # ─── DDoS Detection ──────────────────────────────────────
+    # ─── DDoS Detection (sustained) ──────────────────────────
 
     def _detect_ddos(self, pkt_info):
         """
         Detect DDoS attacks based on high packet rate from the same IP.
-        Tracks packets per source IP over a sliding time window.
+        Requires the rate to be sustained for config-defined seconds
+        to avoid triggering on short bursts.
         """
         alerts = []
         rules = config.RULES['ddos']
@@ -152,11 +173,10 @@ class RuleBasedDetector:
         now = time.time()
         src = pkt_info.src_ip
 
-        # Track packet timestamps and sizes per source IP
         self._ddos_packet_tracker[src].append(now)
         self._ddos_byte_tracker[src].append(pkt_info.length)
 
-        # Clean old entries outside the time window
+        # Clean old entries
         while (self._ddos_packet_tracker[src] and
                now - self._ddos_packet_tracker[src][0] > rules['time_window']):
             self._ddos_packet_tracker[src].popleft()
@@ -168,104 +188,103 @@ class RuleBasedDetector:
         total_bytes = sum(self._ddos_byte_tracker[src])
         byte_rate = total_bytes / rules['time_window']
 
-        # Check packet rate threshold
-        if packet_rate >= rules['packet_rate_threshold']:
-            confidence = min(1.0, packet_rate / (rules['packet_rate_threshold'] * 2))
-            alert = Alert(
-                alert_type='DDoS',
-                severity=rules['severity'],
-                source_ip=src,
-                target_ip=pkt_info.dst_ip,
-                description=(
-                    f"DDoS attack detected from {src}. "
-                    f"{packet_count} packets in {rules['time_window']}s "
-                    f"({packet_rate:.0f} pps, {byte_rate/1024:.1f} KB/s)."
-                ),
-                evidence=[
-                    f"Source IP: {src}",
-                    f"Packet rate: {packet_rate:.1f} packets/s",
-                    f"Threshold: {rules['packet_rate_threshold']} packets/s",
-                    f"Byte rate: {byte_rate/1024:.1f} KB/s",
-                    f"Total packets in window: {packet_count}",
-                    f"Time window: {rules['time_window']}s",
-                    f"Abnormally high traffic volume from single source",
-                ],
-                confidence=confidence,
-            )
-            alerts.append(alert)
-            self._ddos_packet_tracker[src].clear()
-            self._ddos_byte_tracker[src].clear()
+        sustained_seconds = rules.get('sustained_seconds', 5)
+        rate_exceeded = (packet_rate >= rules['packet_rate_threshold']
+                         or byte_rate >= rules['byte_rate_threshold'])
 
-        # Check byte rate threshold
-        elif byte_rate >= rules['byte_rate_threshold']:
-            confidence = min(1.0, byte_rate / (rules['byte_rate_threshold'] * 2))
-            alert = Alert(
-                alert_type='DDoS',
-                severity=rules['severity'],
-                source_ip=src,
-                target_ip=pkt_info.dst_ip,
-                description=(
-                    f"DDoS (volumetric) detected from {src}. "
-                    f"Byte rate: {byte_rate/1024/1024:.1f} MB/s "
-                    f"exceeds threshold."
-                ),
-                evidence=[
-                    f"Source IP: {src}",
-                    f"Byte rate: {byte_rate/1024/1024:.2f} MB/s",
-                    f"Threshold: {rules['byte_rate_threshold']/1024/1024:.0f} MB/s",
-                    f"Packet rate: {packet_rate:.1f} pps",
-                    f"Large volume data flood detected",
-                ],
-                confidence=confidence,
-            )
-            alerts.append(alert)
+        if rate_exceeded:
+            if src not in self._ddos_sustained_start:
+                self._ddos_sustained_start[src] = now
+                return alerts  # Start tracking, don't alert yet
+
+            elapsed = now - self._ddos_sustained_start[src]
+            if elapsed < sustained_seconds:
+                return alerts  # Not sustained long enough
+
+            # Sustained — generate alert
+            del self._ddos_sustained_start[src]
+
+            if packet_rate >= rules['packet_rate_threshold']:
+                confidence = min(1.0, packet_rate / (rules['packet_rate_threshold'] * 2))
+                alert = Alert(
+                    alert_type='DDoS',
+                    severity=rules['severity'],
+                    source_ip=src,
+                    target_ip=pkt_info.dst_ip,
+                    description=(
+                        f"DDoS attack detected from {src}. "
+                        f"{packet_count} packets in {rules['time_window']}s "
+                        f"({packet_rate:.0f} pps), sustained for {elapsed:.0f}s."
+                    ),
+                    evidence=[
+                        f"Source IP: {src}",
+                        f"Packet rate: {packet_rate:.1f} packets/s",
+                        f"Threshold: {rules['packet_rate_threshold']} packets/s",
+                        f"Sustained duration: {elapsed:.0f}s (min {sustained_seconds}s)",
+                        f"Time window: {rules['time_window']}s",
+                    ],
+                    confidence=confidence,
+                )
+                alerts.append(alert)
+            else:
+                confidence = min(1.0, byte_rate / (rules['byte_rate_threshold'] * 2))
+                alert = Alert(
+                    alert_type='DDoS',
+                    severity=rules['severity'],
+                    source_ip=src,
+                    target_ip=pkt_info.dst_ip,
+                    description=(
+                        f"DDoS (volumetric) from {src}. "
+                        f"Byte rate: {byte_rate/1024/1024:.1f} MB/s, "
+                        f"sustained for {elapsed:.0f}s."
+                    ),
+                    evidence=[
+                        f"Source IP: {src}",
+                        f"Byte rate: {byte_rate/1024/1024:.2f} MB/s",
+                        f"Threshold: {rules['byte_rate_threshold']/1024/1024:.0f} MB/s",
+                        f"Sustained duration: {elapsed:.0f}s (min {sustained_seconds}s)",
+                    ],
+                    confidence=confidence,
+                )
+                alerts.append(alert)
+
             self._ddos_packet_tracker[src].clear()
             self._ddos_byte_tracker[src].clear()
+        else:
+            # Rate dropped below threshold — reset sustained tracking
+            if src in self._ddos_sustained_start:
+                del self._ddos_sustained_start[src]
 
         return alerts
 
     # ─── SQL Injection Detection ─────────────────────────────
 
     def _detect_sql_injection(self, pkt_info):
-        """
-        Detect SQL injection attempts by checking packet payloads
-        for suspicious SQL patterns (targeting web/DB ports).
-        """
+        """Detect SQL injection attempts by checking packet payloads."""
         alerts = []
         rules = config.RULES['sql_injection']
 
-        # Only check packets to web/database ports
         if pkt_info.dst_port not in rules['target_ports']:
             return alerts
 
-        # Check DNS query for SQL patterns (sometimes encoded in queries)
         payload_to_check = ''
         if pkt_info.dns_query:
             payload_to_check = pkt_info.dns_query
 
-        # Check if payload size suggests content (without deep inspection)
         if pkt_info.payload_size > 0 and pkt_info.protocol in ('HTTP', 'TCP'):
-            # In a real system, we'd inspect the payload.
-            # Here we track repeated connections to web ports with large payloads
-            # as potential injection vectors.
             now = time.time()
             src = pkt_info.src_ip
 
             self._sqli_tracker[src].append({
-                'time': now,
-                'port': pkt_info.dst_port,
-                'size': pkt_info.payload_size,
-                'target': pkt_info.dst_ip,
+                'time': now, 'port': pkt_info.dst_port,
+                'size': pkt_info.payload_size, 'target': pkt_info.dst_ip,
             })
 
-            # Clean old entries (60s window)
             while (self._sqli_tracker[src] and
                    now - self._sqli_tracker[src][0]['time'] > 60):
                 self._sqli_tracker[src].popleft()
 
-            # Flag if many requests with payloads to web ports in short time
-            web_requests = [r for r in self._sqli_tracker[src]
-                           if r['size'] > 100]  # Meaningful payload size
+            web_requests = [r for r in self._sqli_tracker[src] if r['size'] > 100]
 
             if len(web_requests) >= 20:
                 confidence = min(1.0, len(web_requests) / 40)
@@ -287,8 +306,6 @@ class RuleBasedDetector:
                         f"Request count: {len(web_requests)} in 60s",
                         f"Average payload size: {avg_size:.0f} bytes",
                         f"Target ports: {set(r['port'] for r in web_requests)}",
-                        f"Target hosts: {', '.join(list(targets)[:5])}",
-                        f"Rapid payload-bearing requests to web/DB ports",
                         f"Pattern consistent with SQLi/XSS scanning",
                     ],
                     confidence=confidence,
@@ -313,11 +330,9 @@ class RuleBasedDetector:
             self._port_scan_tracker[src][dst].add(pkt_info.dst_port)
             self._port_scan_times[src].append(now)
 
-            # Clean old entries
             while self._port_scan_times[src] and now - self._port_scan_times[src][0] > rules['time_window']:
                 self._port_scan_times[src].popleft()
 
-            # Check threshold
             all_ports = set()
             for target, ports in self._port_scan_tracker[src].items():
                 all_ports.update(ports)
@@ -339,12 +354,10 @@ class RuleBasedDetector:
                         f"Target hosts: {', '.join(targets[:5])}",
                         f"Sample ports: {sorted(list(all_ports))[:10]}",
                         f"All SYN packets (no established connections)",
-                        f"Time window: {rules['time_window']}s",
                     ],
                     confidence=confidence,
                 )
                 alerts.append(alert)
-                # Reset tracker for this source
                 self._port_scan_tracker[src].clear()
 
         return alerts
@@ -362,7 +375,6 @@ class RuleBasedDetector:
 
             self._syn_tracker[target].append(now)
 
-            # Clean old entries
             while self._syn_tracker[target] and now - self._syn_tracker[target][0] > rules['time_window']:
                 self._syn_tracker[target].popleft()
 
@@ -383,8 +395,6 @@ class RuleBasedDetector:
                         f"Rate: {rate:.1f} SYN/s",
                         f"Threshold: {rules['threshold']} SYN/s",
                         f"No corresponding ACK packets observed",
-                        f"Multiple source IPs (potential spoofing)",
-                        f"Time window: {rules['time_window']}s",
                     ],
                     confidence=confidence,
                 )
@@ -427,7 +437,6 @@ class RuleBasedDetector:
                             f"Target service: {service} (port {pkt_info.dst_port})",
                             f"Connection attempts: {count}",
                             f"Threshold: {rules['threshold']} attempts/{rules['time_window']}s",
-                            f"Rapid SYN/RST pattern indicates failed logins",
                         ],
                         confidence=confidence,
                     )
@@ -450,11 +459,9 @@ class RuleBasedDetector:
 
             self._dns_tracker[src].append((now, query))
 
-            # Clean old entries
             while self._dns_tracker[src] and now - self._dns_tracker[src][0][0] > 60:
                 self._dns_tracker[src].popleft()
 
-            # Check query length
             if len(query) > rules['query_length_threshold']:
                 confidence = min(1.0, len(query) / (rules['query_length_threshold'] * 3))
                 alert = Alert(
@@ -468,14 +475,11 @@ class RuleBasedDetector:
                         f"Query: {query[:80]}...",
                         f"Query length: {len(query)} characters",
                         f"Normal threshold: {rules['query_length_threshold']} chars",
-                        f"Possible data exfiltration via DNS",
-                        f"High entropy in subdomain suggests encoded data",
                     ],
                     confidence=confidence,
                 )
                 alerts.append(alert)
 
-            # Check frequency
             recent_queries = [q for t, q in self._dns_tracker[src]]
             domain_counts = defaultdict(int)
             for q in recent_queries:
@@ -498,7 +502,6 @@ class RuleBasedDetector:
                             f"Target domain: {domain}",
                             f"Query frequency: {count}/min",
                             f"Threshold: {rules['frequency_threshold']}/min",
-                            f"Consistent sub-domain variation suggests tunneling",
                         ],
                         confidence=confidence,
                     )
@@ -538,7 +541,6 @@ class RuleBasedDetector:
                         f"ICMP packets: {count}",
                         f"Rate: {rate:.1f} packets/s",
                         f"Threshold: {rules['threshold']} packets/s",
-                        f"ICMP type: {pkt_info.icmp_type}",
                     ],
                     confidence=confidence,
                 )
@@ -547,19 +549,36 @@ class RuleBasedDetector:
 
         return alerts
 
-    # ─── ARP Spoofing Detection ──────────────────────────────
+    # ─── ARP Spoofing Detection (improved) ───────────────────
 
     def _detect_arp_spoofing(self, pkt_info):
-        """Detect ARP spoofing (duplicate IP with different MACs)."""
+        """
+        Detect ARP spoofing — only flag when the SAME IP maps to
+        multiple different MAC addresses within the time window.
+        Normal ARP request/reply pairs are ignored.
+        """
         alerts = []
         rules = config.RULES['arp_spoofing']
 
         if pkt_info.protocol == 'ARP' and pkt_info.src_ip and pkt_info.src_mac:
             ip = pkt_info.src_ip
             mac = pkt_info.src_mac
+            now = time.time()
+
+            # Ignore ARP requests (op=1) — only track replies (op=2)
+            # and gratuitous ARP. Requests are normal network discovery.
+            if pkt_info.arp_op == 1:
+                return alerts
 
             self._arp_table[ip].add(mac)
+            self._arp_timestamps[ip].append(now)
 
+            # Clean old timestamps outside the window
+            while (self._arp_timestamps[ip] and
+                   now - self._arp_timestamps[ip][0] > rules['time_window']):
+                self._arp_timestamps[ip].popleft()
+
+            # Only alert if multiple MACs are seen for the same IP
             if len(self._arp_table[ip]) >= rules['duplicate_threshold']:
                 macs = list(self._arp_table[ip])
                 alert = Alert(
@@ -571,47 +590,74 @@ class RuleBasedDetector:
                         f"IP Address: {ip}",
                         f"MAC addresses observed: {', '.join(macs)}",
                         f"Threshold: {rules['duplicate_threshold']} different MACs",
+                        f"Time window: {rules['time_window']}s",
+                        f"Only ARP replies tracked (requests ignored)",
                         f"This indicates potential man-in-the-middle attack",
-                        f"ARP cache poisoning suspected",
                     ],
                     confidence=0.85,
                 )
                 alerts.append(alert)
-                # Reset the tracked MACs for this IP to prevent endless alert spamming
                 self._arp_table[ip].clear()
 
         return alerts
 
-    # ─── Encrypted Traffic Anomaly ───────────────────────────
+    # ─── Encrypted Traffic Anomaly (reduced false positives) ─
 
     def _detect_encrypted_anomaly(self, pkt_info):
-        """Detect anomalies in encrypted traffic without payload inspection."""
+        """
+        Detect anomalies in encrypted traffic.
+        Only alerts after seeing deprecated TLS repeatedly from the same IP
+        to avoid flagging normal HTTPS traffic.
+        """
         alerts = []
         rules = config.RULES['encrypted_anomaly']
 
         if pkt_info.is_encrypted and pkt_info.tls_version:
             src = pkt_info.src_ip
 
-            # Check for deprecated TLS versions
             deprecated_versions = {'SSL 3.0', 'TLS 1.0', 'TLS 1.1'}
+
             if pkt_info.tls_version in deprecated_versions:
-                alert = Alert(
-                    alert_type='Encrypted Traffic Anomaly',
-                    severity=rules['severity'],
-                    source_ip=src,
-                    target_ip=pkt_info.dst_ip,
-                    description=f"Deprecated {pkt_info.tls_version} detected from {src}. This may indicate a downgrade attack or misconfigured client.",
-                    evidence=[
-                        f"Source IP: {src}",
-                        f"TLS Version: {pkt_info.tls_version}",
-                        f"Minimum recommended: TLS 1.2",
-                        f"Deprecated protocols are vulnerable to known attacks",
-                        f"Could indicate TLS downgrade attack (e.g., POODLE)",
-                        f"Destination: {pkt_info.dst_ip}:{pkt_info.dst_port}",
-                    ],
-                    confidence=0.7,
-                )
-                alerts.append(alert)
+                now = time.time()
+                self._encrypted_tracker[src].append({
+                    'time': now,
+                    'version': pkt_info.tls_version,
+                    'dst': pkt_info.dst_ip,
+                })
+
+                # Clean old entries (60s window)
+                while (self._encrypted_tracker[src] and
+                       now - self._encrypted_tracker[src][0]['time'] > 60):
+                    self._encrypted_tracker[src].popleft()
+
+                rep_threshold = rules.get('repetition_threshold', 5)
+                deprecated_count = len(self._encrypted_tracker[src])
+
+                # Only alert if deprecated TLS is seen repeatedly
+                if deprecated_count >= rep_threshold:
+                    versions_seen = set(e['version'] for e in self._encrypted_tracker[src])
+                    alert = Alert(
+                        alert_type='Encrypted Traffic Anomaly',
+                        severity=rules['severity'],
+                        source_ip=src,
+                        target_ip=pkt_info.dst_ip,
+                        description=(
+                            f"Repeated deprecated TLS usage from {src}. "
+                            f"{deprecated_count} occurrences of {', '.join(versions_seen)} in 60s."
+                        ),
+                        evidence=[
+                            f"Source IP: {src}",
+                            f"TLS Versions: {', '.join(versions_seen)}",
+                            f"Occurrences: {deprecated_count} (threshold: {rep_threshold})",
+                            f"Minimum recommended: TLS 1.2",
+                            f"Repeated usage suggests misconfiguration or downgrade attack",
+                        ],
+                        confidence=0.7,
+                    )
+                    alerts.append(alert)
+                    self._encrypted_tracker[src].clear()
+
+            # Normal TLS 1.2/1.3 → do NOT alert (this was causing false positives)
 
         return alerts
 

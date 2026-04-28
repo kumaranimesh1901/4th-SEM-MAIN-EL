@@ -4,7 +4,7 @@ A real-time, AI-based **Smart Firewall and Intrusion Detection System (IDS)** fo
 
 ![Python](https://img.shields.io/badge/Python-3.9+-blue)
 ![Flask](https://img.shields.io/badge/Flask-2.3+-green)
-![XGBoost](https://img.shields.io/badge/XGBoost-99.7%25_Accuracy-orange)
+![XGBoost](https://img.shields.io/badge/XGBoost-99.74%25_Accuracy-orange)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
@@ -34,9 +34,9 @@ A real-time, AI-based **Smart Firewall and Intrusion Detection System (IDS)** fo
 - **🔥 Smart Firewall** — BLOCK / FLAG / ALLOW decision engine with simulated IP blocking
 - **📦 Real-time Packet Capture** — Live packet sniffing using Scapy with metadata extraction
 - **🧠 Hybrid Detection Engine** — Rule-based + XGBoost + Isolation Forest working in concert
-- **🎯 XGBoost Classifier** — Trained on CICIDS-2017 with **99.7% accuracy** across 27 attack classes
+- **🎯 XGBoost Classifier** — Trained on CICIDS-2017 with **99.74% accuracy** across 27 attack classes
 - **🌲 Isolation Forest Fallback** — Unsupervised anomaly detection when XGBoost is unavailable
-- **📏 Rule-Based Detection** — DDoS, Port Scan, SYN Flood, SQL Injection, Brute Force, DNS Tunneling, ICMP Flood, ARP Spoofing
+- **📏 Rule-Based Detection** — DDoS, Port Scan, SYN Flood, SQL Injection, Brute Force, DNS Tunneling, ICMP Flood, ARP Spoofing, Encrypted Anomaly
 - **⚖️ Decision Engine** — Combines detection outputs into BLOCK/FLAG/ALLOW decisions
 - **📱 Telegram Alerts** — Real-time notifications for HIGH/CRITICAL severity attacks
 - **📊 Live Dashboard** — 6-tab web UI with Chart.js visualizations and WebSocket real-time updates
@@ -92,8 +92,10 @@ A real-time, AI-based **Smart Firewall and Intrusion Detection System (IDS)** fo
 ├── requirements.txt               # Python dependencies
 ├── train_xgboost.py               # XGBoost model training pipeline
 ├── download_dataset.py            # CICIDS-2017 dataset download helper
+├── test_attack.py                 # Synthetic attack simulation testing script
 ├── README.md                      # This file
-├── REPORT.md                      # Detailed project report
+├── REPORT.md                      # Detailed project report (Phase 2)
+├── PHASE1_REPORT.md               # Phase 1 project report
 │
 ├── engine/                        # Core engine modules
 │   ├── __init__.py
@@ -120,10 +122,10 @@ A real-time, AI-based **Smart Firewall and Intrusion Detection System (IDS)** fo
 │   └── friday.csv
 │
 ├── models/                        # Trained ML model files
-│   ├── xgboost_model.json         # Trained XGBoost model (99.7% accuracy)
+│   ├── xgboost_model.json         # Trained XGBoost model (99.74% accuracy)
 │   ├── xgb_scaler.pkl             # Feature scaler
 │   ├── xgb_label_encoder.pkl      # Label encoder (27 classes)
-│   ├── xgb_feature_names.pkl      # Feature column names (85 features)
+│   ├── xgb_feature_names.pkl      # Feature column names (81 features)
 │   ├── xgb_metadata.pkl           # Training metadata
 │   ├── isolation_forest.pkl       # Fallback IF model
 │   └── scaler.pkl                 # Fallback IF scaler
@@ -143,7 +145,7 @@ A real-time, AI-based **Smart Firewall and Intrusion Detection System (IDS)** fo
 ## Prerequisites
 
 - **Python 3.9** or higher
-- **macOS / Linux** (packet capture requires appropriate permissions)
+- **macOS / Linux / Windows** (packet capture requires appropriate permissions; Windows requires Npcap)
 - **pip** (Python package manager)
 
 ---
@@ -180,6 +182,12 @@ This installs:
 ```bash
 brew install libomp
 ```
+
+### Step 3 (Windows): Install Npcap
+
+For Windows, `scapy` requires **Npcap** to capture live network packets.
+1. Download Npcap from [npcap.com](https://npcap.com/#download)
+2. Run the installer. Ensure you select the option **"Install Npcap in WinPcap API-compatible Mode"** during installation.
 
 ---
 
@@ -252,7 +260,7 @@ http://localhost:5050
 ### What happens on startup:
 
 1. Flask server starts on port **5050**
-2. XGBoost model loads automatically from `models/` (99.7% accuracy)
+2. XGBoost model loads automatically from `models/` (99.74% accuracy)
 3. If no XGBoost model exists, Isolation Forest fallback is used
 4. Packet capture starts automatically (or simulation mode if no root)
 5. Decision engine initializes with BLOCK/FLAG/ALLOW logic
@@ -432,7 +440,7 @@ The web dashboard at `http://localhost:5050` provides 6 tabs:
 
 ## Troubleshooting
 
-### XGBoost import error: `libomp.dylib not found`
+### XGBoost import error: `libomp.dylib not found` (macOS)
 
 ```bash
 brew install libomp
@@ -441,10 +449,21 @@ brew install libomp
 ### Permission denied for packet capture
 
 ```bash
-sudo python3 app.py
+sudo python3 app.py # macOS/Linux
+# On Windows, run the command prompt or terminal as Administrator
 ```
 
-> Without sudo, the system automatically falls back to simulation mode.
+> Without admin/root privileges, the system automatically falls back to simulation mode.
+
+### Windows Interface Configuration (Scapy NPF Devices)
+
+If packet capture isn't working on Windows or you need to manually set `CAPTURE_INTERFACE` in `config.py`, note that Scapy uses device GUIDs (e.g., `\Device\NPF_{...}`) instead of friendly names like "Wi-Fi" or "Ethernet".
+
+To find the correct interface string, open your terminal and run:
+```bash
+python -c "from scapy.all import show_interfaces; show_interfaces()"
+```
+This will display a table mapping your readable network adapters to their `\Device\NPF_{...}` names. Copy the exact NPF string for your active internet connection and set it as your `CAPTURE_INTERFACE`.
 
 ### Dataset CSV files are Git LFS pointers
 
@@ -475,6 +494,7 @@ python3 app.py
 # 1. Install dependencies
 pip3 install -r requirements.txt
 brew install libomp    # macOS only, for XGBoost
+# Windows users: Install Npcap from https://npcap.com/#download (Enable WinPcap compatible mode)
 
 # 2. Download CICIDS-2017 dataset from Hugging Face
 python3 download_dataset.py

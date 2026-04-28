@@ -19,7 +19,7 @@ from collections import deque, defaultdict
 from detection.rule_engine import RuleBasedDetector, Alert
 from detection.ml_detector import MLDetector
 from engine.flow_analyzer import FlowAnalyzer
-from engine.decision_engine import DecisionEngine
+from engine.decision_engine import DecisionEngine, _is_safe_ip
 from engine.feature_extraction import FeatureExtractor
 from alerts.telegram_alert import TelegramAlerter
 
@@ -42,8 +42,9 @@ class HybridDetector:
         # Decision engine (firewall)
         self.decision_engine = DecisionEngine()
         self.decision_engine.block_duration = config.FIREWALL.get('block_duration', 300)
-        self.decision_engine.flag_threshold = config.FIREWALL.get('flag_threshold', 3)
-        self.decision_engine.min_confidence = config.FIREWALL.get('min_ml_confidence', 0.5)
+        self.decision_engine.flag_threshold = config.FIREWALL.get('flag_threshold', 5)
+        self.decision_engine.min_confidence = config.FIREWALL.get('min_ml_confidence', 0.8)
+        self.decision_engine.min_packet_count = config.FIREWALL.get('min_packet_count_before_action', 10)
 
         # Telegram alerter
         self.telegram = TelegramAlerter(
@@ -111,24 +112,34 @@ class HybridDetector:
         Process a packet through the full detection pipeline.
 
         Flow:
-        1. Extract features
-        2. Update flow
-        3. Rule-based detection
-        4. ML detection (run on every qualifying flow packet, cache results)
-        5. Decision engine — combine rule + cached ML for same src IP
-        6. Telegram alerts for high severity
-        7. Track normal traffic
+        0. Skip safe/whitelisted IPs immediately
+        1. Increment per-IP packet count (for decision engine validation)
+        2. Extract features
+        3. Update flow
+        4. Rule-based detection
+        5. ML detection (run on every qualifying flow packet, cache results)
+        6. Decision engine — combine rule + cached ML for same src IP
+        7. Telegram alerts for high severity
+        8. Track normal traffic
         """
-        # Step 1: Extract packet features
+        # Step 0: Skip safe / private / whitelisted IPs entirely
+        if _is_safe_ip(pkt_info.src_ip):
+            self._track_normal_traffic(pkt_info)
+            return
+
+        # Step 1: Increment packet count for this IP (decision engine uses it)
+        self.decision_engine.increment_packet_count(pkt_info.src_ip)
+
+        # Step 2: Extract packet features
         pkt_features = self.feature_extractor.extract_packet_features(pkt_info)
 
-        # Step 2: Update flow
+        # Step 3: Update flow
         flow = self.flow_analyzer.process_packet(pkt_info)
 
-        # Step 3: Rule-based detection
+        # Step 4: Rule-based detection
         rule_alerts = self.rule_detector.analyze_packet(pkt_info, flow)
 
-        # Step 4: ML detection
+        # Step 5: ML detection
         # Run ML on every 3rd packet of flows with >= 3 packets
         ml_result = None
         anomaly_result = None
@@ -138,14 +149,12 @@ class HybridDetector:
             ml_result, anomaly_result = self._run_ml_prediction(flow, pkt_info)
             ml_ran_this_packet = True
 
-        # Step 4b: If rules fired but ML didn't run yet, FORCE ML on this flow
-        # This is the key to getting hybrid (Rule + ML) decisions together
+        # Step 5b: If rules fired but ML didn't run yet, FORCE ML on this flow
         if rule_alerts and not ml_ran_this_packet and flow:
             ml_result, anomaly_result = self._run_ml_prediction(flow, pkt_info)
             ml_ran_this_packet = True
 
-        # Step 4c: If ML still didn't run (no flow / too few packets),
-        # use cached ML result for this source IP
+        # Step 5c: Use cached ML result if ML didn't run
         if ml_result is None and anomaly_result is None:
             cached = self._ml_cache.get(pkt_info.src_ip)
             if cached and (time.time() - cached['timestamp']) < self._ml_cache_ttl:
@@ -154,9 +163,7 @@ class HybridDetector:
                 else:
                     ml_result = cached['result']
 
-        # Step 5: Decision Engine — run when rules or ML detected something
-        # Always pass ml_result to the decision engine when rules fire,
-        # so the firewall decision table can show ML was at least consulted
+        # Step 6: Decision Engine
         if rule_alerts or (ml_result and ml_result.get('is_attack')) or anomaly_result:
             decision = self.decision_engine.make_decision(
                 source_ip=pkt_info.src_ip,
@@ -169,17 +176,15 @@ class HybridDetector:
             # Update stats
             if decision.action == 'BLOCK':
                 self.stats['blocked'] += 1
-                # Send Telegram alert for blocks
                 self.telegram.send_firewall_action(decision)
             elif decision.action == 'FLAG':
                 self.stats['flagged'] += 1
-                # Send Telegram for high/critical severity flags
                 if decision.severity in ('high', 'critical'):
                     self.telegram.send_firewall_action(decision)
             else:
                 self.stats['allowed'] += 1
         else:
-            # Step 7: Track normal/clean traffic
+            # Step 8: Track normal/clean traffic
             self._track_normal_traffic(pkt_info)
 
     def _run_ml_prediction(self, flow, pkt_info):

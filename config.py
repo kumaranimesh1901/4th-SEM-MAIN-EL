@@ -23,6 +23,31 @@ PACKET_BUFFER_SIZE = 1000  # Max packets to keep in memory
 CAPTURE_TIMEOUT = 0  # 0 = continuous capture
 
 # ============================================================
+# IP Whitelist & Safe Traffic Settings
+# ============================================================
+# Private / internal IP prefixes — never flag or block these
+PRIVATE_IP_PREFIXES = (
+    '192.168.',
+    '10.',
+    '127.',
+    '172.16.', '172.17.', '172.18.', '172.19.',
+    '172.20.', '172.21.', '172.22.', '172.23.',
+    '172.24.', '172.25.', '172.26.', '172.27.',
+    '172.28.', '172.29.', '172.30.', '172.31.',
+)
+
+# Explicitly whitelisted external IPs (known safe services)
+WHITELISTED_IPS = {
+    '1.1.1.1',          # Cloudflare DNS
+    '1.0.0.1',          # Cloudflare DNS secondary
+    '8.8.8.8',          # Google DNS
+    '8.8.4.4',          # Google DNS secondary
+    '208.67.222.222',   # OpenDNS
+    '208.67.220.220',   # OpenDNS secondary
+    '9.9.9.9',          # Quad9 DNS
+}
+
+# ============================================================
 # Detection Settings
 # ============================================================
 ALERT_HISTORY_SIZE = 500  # Max alerts to keep in memory
@@ -64,6 +89,7 @@ RULES = {
         'packet_rate_threshold': 200,  # Packets per second from same IP
         'byte_rate_threshold': 10485760,  # 10 MB/s from same IP
         'time_window': 10,
+        'sustained_seconds': 5,  # Must be sustained for this many seconds
         'severity': 'critical',
     },
     'sql_injection': {
@@ -103,8 +129,8 @@ RULES = {
         'severity': 'medium',
     },
     'arp_spoofing': {
-        'duplicate_threshold': 5,  # Same IP with different MACs
-        'time_window': 30,
+        'duplicate_threshold': 3,   # Same IP with different MACs (lowered for accuracy)
+        'time_window': 60,          # Wider window to catch real spoofing
         'severity': 'critical',
     },
     'brute_force': {
@@ -125,6 +151,7 @@ RULES = {
         'cert_age_threshold': 30,       # Days - suspicious if cert is very new
         'ja3_blacklist': [],             # Known malicious JA3 hashes
         'tls_version_min': 0x0303,      # Minimum TLS 1.2
+        'repetition_threshold': 5,      # Must see deprecated TLS this many times before alerting
         'severity': 'medium',
     },
 }
@@ -133,10 +160,11 @@ RULES = {
 # Decision Engine / Firewall Settings
 # ============================================================
 FIREWALL = {
-    'block_duration': 300,       # Seconds to block an IP (5 minutes)
-    'flag_threshold': 3,         # Number of FLAG events before auto-BLOCK
-    'min_ml_confidence': 0.5,    # Minimum ML confidence for decisions
-    'enable_iptables': False,    # Set True for real iptables integration (Linux only)
+    'block_duration': 300,                # Seconds to block an IP (5 minutes)
+    'flag_threshold': 5,                  # Number of FLAG events before auto-BLOCK (raised from 3)
+    'min_ml_confidence': 0.8,             # Minimum ML confidence for decisions (raised from 0.5)
+    'enable_iptables': False,             # Set True for real iptables integration (Linux only)
+    'min_packet_count_before_action': 10, # Minimum packets from an IP before BLOCK/FLAG
 }
 
 # ============================================================

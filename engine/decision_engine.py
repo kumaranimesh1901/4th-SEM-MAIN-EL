@@ -4,16 +4,48 @@ Combines outputs from rule-based detection, Isolation Forest anomaly detection,
 and XGBoost classification to make final BLOCK / FLAG / ALLOW decisions.
 
 Decision Logic:
+  - Whitelisted / private IPs → always ALLOW (never block internal traffic)
   - If Rule-Based + ML both confirm attack → BLOCK traffic (auto)
   - If only one engine detects, or anomaly only  → FLAG as suspicious (manual action)
   - If neither detects → ALLOW traffic
   - If an IP is flagged >= threshold times → auto-BLOCK
+  - Minimum packet count must be met before any BLOCK action
 """
 
 import time
+import logging
 import threading
 from collections import defaultdict, deque
 from datetime import datetime
+
+import config
+
+# ─── Structured Logger ────────────────────────────────────────
+logger = logging.getLogger('netguard.decision')
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] DECISION %(levelname)s: %(message)s',
+        datefmt='%H:%M:%S',
+    ))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
+def _is_safe_ip(ip):
+    """
+    Check whether an IP is private/internal or explicitly whitelisted.
+    These IPs should NEVER be blocked or flagged.
+    """
+    if not ip:
+        return False
+    # Check private/internal prefixes
+    if ip.startswith(config.PRIVATE_IP_PREFIXES):
+        return True
+    # Check explicit whitelist
+    if ip in config.WHITELISTED_IPS:
+        return True
+    return False
 
 
 class FirewallAction:
@@ -25,7 +57,8 @@ class FirewallAction:
 
     def __init__(self, action, reason='', source_ip='', target_ip='',
                  attack_type='', severity='low', confidence=0.0,
-                 rule_matched=False, ml_matched=False, anomaly_detected=False):
+                 rule_matched=False, ml_matched=False, anomaly_detected=False,
+                 packet_count=0, detection_details=None):
         self.action = action
         self.reason = reason
         self.source_ip = source_ip
@@ -36,6 +69,8 @@ class FirewallAction:
         self.rule_matched = rule_matched
         self.ml_matched = ml_matched
         self.anomaly_detected = anomaly_detected
+        self.packet_count = packet_count
+        self.detection_details = detection_details or []
         self.timestamp = time.time()
 
     def to_dict(self):
@@ -50,6 +85,8 @@ class FirewallAction:
             'rule_matched': self.rule_matched,
             'ml_matched': self.ml_matched,
             'anomaly_detected': self.anomaly_detected,
+            'packet_count': self.packet_count,
+            'detection_details': self.detection_details,
             'timestamp': self.timestamp,
             'time_str': datetime.fromtimestamp(self.timestamp).strftime('%H:%M:%S'),
         }
@@ -61,10 +98,12 @@ class DecisionEngine:
     firewall actions: BLOCK, FLAG, or ALLOW.
 
     Implements the hybrid decision logic:
+      0. Whitelisted / private IPs → ALLOW immediately (no exceptions)
       1. Rule-based + ML both confirm → BLOCK (auto-firewall)
       2. Single engine detection → FLAG (manual action required)
       3. Repeated FLAGs → auto-BLOCK after threshold
       4. Neither engine flags → ALLOW
+      5. Minimum packet count must be met before any blocking action
     """
 
     def __init__(self):
@@ -77,12 +116,17 @@ class DecisionEngine:
         self._blocked_ips = {}        # ip -> {timestamp, reason, duration}
         self._flagged_ips = {}        # ip -> {timestamp, reason, count}
 
+        # Per-IP packet counters (for minimum packet validation)
+        self._ip_packet_counts = defaultdict(int)
+
         # Statistics
         self.stats = {
             'total_decisions': 0,
             'blocked': 0,
             'flagged': 0,
             'allowed': 0,
+            'whitelisted_skips': 0,
+            'insufficient_packets_skips': 0,
             'blocked_ips_count': 0,
             'flagged_ips_count': 0,
         }
@@ -92,12 +136,22 @@ class DecisionEngine:
 
         # Configuration
         self.block_duration = 300     # seconds to block an IP (5 minutes)
-        self.flag_threshold = 3       # number of flagged events before auto-block
-        self.min_confidence = 0.5     # minimum confidence for ML-based decisions
+        self.flag_threshold = 5       # number of flagged events before auto-block
+        self.min_confidence = 0.8     # minimum confidence for ML-based decisions
+        self.min_packet_count = 10    # minimum packets from IP before blocking
 
     def register_callback(self, callback):
         """Register callback for firewall decisions."""
         self._callbacks.append(callback)
+
+    def increment_packet_count(self, ip):
+        """Increment the observed packet count for an IP (called from pipeline)."""
+        if ip:
+            self._ip_packet_counts[ip] += 1
+
+    def get_packet_count(self, ip):
+        """Get observed packet count for an IP."""
+        return self._ip_packet_counts.get(ip, 0)
 
     def make_decision(self, source_ip, target_ip='', rule_alerts=None,
                       ml_result=None, anomaly_result=None):
@@ -116,6 +170,28 @@ class DecisionEngine:
         Returns:
             FirewallAction: The decision (BLOCK, FLAG, or ALLOW)
         """
+        pkt_count = self.get_packet_count(source_ip)
+
+        # ─── GATE 0: Safe / whitelisted IP → always ALLOW ─────
+        if _is_safe_ip(source_ip):
+            self.stats['whitelisted_skips'] += 1
+            action = FirewallAction(
+                action=FirewallAction.ALLOW,
+                reason=f'Safe/whitelisted IP — not flagged ({source_ip})',
+                source_ip=source_ip,
+                target_ip=target_ip,
+                severity='low',
+                confidence=0.0,
+                packet_count=pkt_count,
+                detection_details=[
+                    f'IP {source_ip} is private/internal or whitelisted',
+                    'Policy: safe IPs are never blocked or flagged',
+                ],
+            )
+            # Log but do NOT record as a full decision to keep stats clean
+            logger.debug("ALLOW (safe IP): %s", source_ip)
+            return action
+
         # Check if IP is already blocked
         if self._is_ip_blocked(source_ip):
             action = FirewallAction(
@@ -126,6 +202,7 @@ class DecisionEngine:
                 severity='high',
                 confidence=1.0,
                 rule_matched=True,
+                packet_count=pkt_count,
             )
             self._record_decision(action)
             return action
@@ -140,6 +217,7 @@ class DecisionEngine:
         attack_type = ''
         severity = 'low'
         confidence = 0.0
+        detection_details = []
 
         if rule_matched:
             # Use the highest severity rule alert
@@ -147,10 +225,12 @@ class DecisionEngine:
             attack_type = best_alert.alert_type
             severity = best_alert.severity
             confidence = best_alert.confidence
+            detection_details.append(f"Rule: {attack_type} (conf={confidence:.2f})")
 
         if ml_matched:
             ml_type = ml_result.get('attack_type', 'Unknown')
             ml_conf = ml_result.get('confidence', 0)
+            detection_details.append(f"ML: {ml_type} (conf={ml_conf:.2f})")
             if ml_conf > confidence:
                 attack_type = ml_type
                 confidence = ml_conf
@@ -159,10 +239,45 @@ class DecisionEngine:
                 self._ml_severity(ml_type, ml_conf)
             )
 
+        if anomaly_detected:
+            anom_conf = anomaly_result.get('confidence', 0)
+            detection_details.append(f"Anomaly detected (conf={anom_conf:.2f})")
+
+        # ─── GATE 1: Minimum packet count validation ──────────
+        # Before any BLOCK, ensure the IP has been seen enough times
+        # to avoid blocking on one-off / transient noise
+        min_pkts = self.min_packet_count
+        insufficient_packets = pkt_count < min_pkts
+
         # ─── Decision Logic ───────────────────────────────────
 
         # Case 1: Both rule-based AND ML confirm attack → BLOCK
         if rule_matched and ml_matched:
+            if insufficient_packets:
+                # Downgrade to FLAG until packet count threshold is met
+                self.stats['insufficient_packets_skips'] += 1
+                logger.info(
+                    "DOWNGRADE BLOCK→FLAG: %s (%s) — only %d packets (need %d)",
+                    source_ip, attack_type, pkt_count, min_pkts,
+                )
+                action = FirewallAction(
+                    action=FirewallAction.FLAG,
+                    reason=f'Hybrid confirmed ({attack_type}) but insufficient packets ({pkt_count}/{min_pkts}) — Action Required',
+                    source_ip=source_ip,
+                    target_ip=target_ip,
+                    attack_type=attack_type,
+                    severity=severity,
+                    confidence=confidence,
+                    rule_matched=True,
+                    ml_matched=True,
+                    anomaly_detected=anomaly_detected,
+                    packet_count=pkt_count,
+                    detection_details=detection_details,
+                )
+                self._flag_ip(source_ip, action.reason)
+                self._record_decision(action)
+                return action
+
             action = FirewallAction(
                 action=FirewallAction.BLOCK,
                 reason=f'Hybrid confirmed (Rule + ML): {attack_type}',
@@ -174,6 +289,12 @@ class DecisionEngine:
                 rule_matched=True,
                 ml_matched=True,
                 anomaly_detected=anomaly_detected,
+                packet_count=pkt_count,
+                detection_details=detection_details,
+            )
+            logger.warning(
+                "BLOCK: %s — %s (conf=%.2f, pkts=%d)",
+                source_ip, attack_type, action.confidence, pkt_count,
             )
             self._block_ip(source_ip, action.reason)
             self._record_decision(action)
@@ -181,6 +302,30 @@ class DecisionEngine:
 
         # Case 2: Rule-based with critical severity + high confidence → BLOCK
         if rule_matched and severity == 'critical' and confidence >= 0.85:
+            if insufficient_packets:
+                self.stats['insufficient_packets_skips'] += 1
+                logger.info(
+                    "DOWNGRADE BLOCK→FLAG: %s (%s critical) — only %d packets",
+                    source_ip, attack_type, pkt_count,
+                )
+                action = FirewallAction(
+                    action=FirewallAction.FLAG,
+                    reason=f'Critical rule ({attack_type}) but insufficient packets ({pkt_count}/{min_pkts}) — Action Required',
+                    source_ip=source_ip,
+                    target_ip=target_ip,
+                    attack_type=attack_type,
+                    severity=severity,
+                    confidence=confidence,
+                    rule_matched=True,
+                    ml_matched=False,
+                    anomaly_detected=anomaly_detected,
+                    packet_count=pkt_count,
+                    detection_details=detection_details,
+                )
+                self._flag_ip(source_ip, action.reason)
+                self._record_decision(action)
+                return action
+
             action = FirewallAction(
                 action=FirewallAction.BLOCK,
                 reason=f'Critical rule detection: {attack_type}',
@@ -192,13 +337,19 @@ class DecisionEngine:
                 rule_matched=True,
                 ml_matched=False,
                 anomaly_detected=anomaly_detected,
+                packet_count=pkt_count,
+                detection_details=detection_details,
+            )
+            logger.warning(
+                "BLOCK: %s — critical rule %s (conf=%.2f, pkts=%d)",
+                source_ip, attack_type, confidence, pkt_count,
             )
             self._block_ip(source_ip, action.reason)
             self._record_decision(action)
             return action
 
         # Case 3: ML highly confident + anomaly → FLAG (action required)
-        if ml_matched and anomaly_detected and confidence >= 0.7:
+        if ml_matched and anomaly_detected and confidence >= 0.8:
             action = FirewallAction(
                 action=FirewallAction.FLAG,
                 reason=f'ML + Anomaly confirmed: {attack_type} — Action Required',
@@ -210,13 +361,16 @@ class DecisionEngine:
                 rule_matched=False,
                 ml_matched=True,
                 anomaly_detected=True,
+                packet_count=pkt_count,
+                detection_details=detection_details,
             )
+            logger.info("FLAG: %s — ML+Anomaly %s (conf=%.2f)", source_ip, attack_type, confidence)
             self._flag_ip(source_ip, action.reason)
             self._record_decision(action)
             return action
 
         # Case 4: Rule-based detection only → FLAG
-        if rule_matched and confidence >= 0.5:
+        if rule_matched and confidence >= 0.6:
             action = FirewallAction(
                 action=FirewallAction.FLAG,
                 reason=f'Rule-based detection: {attack_type} — Action Required',
@@ -228,7 +382,10 @@ class DecisionEngine:
                 rule_matched=True,
                 ml_matched=False,
                 anomaly_detected=anomaly_detected,
+                packet_count=pkt_count,
+                detection_details=detection_details,
             )
+            logger.info("FLAG: %s — rule %s (conf=%.2f)", source_ip, attack_type, confidence)
             self._flag_ip(source_ip, action.reason)
             self._record_decision(action)
             return action
@@ -246,7 +403,10 @@ class DecisionEngine:
                 rule_matched=False,
                 ml_matched=True,
                 anomaly_detected=anomaly_detected,
+                packet_count=pkt_count,
+                detection_details=detection_details,
             )
+            logger.info("FLAG: %s — ML %s (conf=%.2f)", source_ip, attack_type, confidence)
             self._flag_ip(source_ip, action.reason)
             self._record_decision(action)
             return action
@@ -264,7 +424,10 @@ class DecisionEngine:
                 rule_matched=False,
                 ml_matched=False,
                 anomaly_detected=True,
+                packet_count=pkt_count,
+                detection_details=detection_details,
             )
+            logger.info("FLAG: %s — anomaly only (conf=%.2f)", source_ip, action.confidence)
             self._flag_ip(source_ip, action.reason)
             self._record_decision(action)
             return action
@@ -277,12 +440,18 @@ class DecisionEngine:
             target_ip=target_ip,
             severity='low',
             confidence=0.0,
+            packet_count=pkt_count,
         )
         self._record_decision(action)
         return action
 
     def _block_ip(self, ip, reason):
         """Add IP to blocked list (simulated firewall)."""
+        # Final safety check — never block safe IPs
+        if _is_safe_ip(ip):
+            logger.warning("REFUSED to block safe IP %s — policy override", ip)
+            return
+
         with self._lock:
             self._blocked_ips[ip] = {
                 'timestamp': time.time(),
@@ -297,6 +466,10 @@ class DecisionEngine:
 
     def _flag_ip(self, ip, reason):
         """Add IP to flagged list, auto-block after threshold."""
+        # Never flag safe IPs
+        if _is_safe_ip(ip):
+            return
+
         with self._lock:
             if ip not in self._flagged_ips:
                 self._flagged_ips[ip] = {
@@ -311,9 +484,14 @@ class DecisionEngine:
 
             self.stats['flagged_ips_count'] = len(self._flagged_ips)
 
-            # Auto-block after repeated flags
-            if self._flagged_ips[ip]['count'] >= self.flag_threshold:
-                print(f"[!] Auto-blocking {ip} after {self._flagged_ips[ip]['count']} flags")
+            # Auto-block after repeated flags — only if packet count is sufficient
+            pkt_count = self._ip_packet_counts.get(ip, 0)
+            if (self._flagged_ips[ip]['count'] >= self.flag_threshold
+                    and pkt_count >= self.min_packet_count):
+                logger.warning(
+                    "Auto-blocking %s after %d flags (pkts=%d)",
+                    ip, self._flagged_ips[ip]['count'], pkt_count,
+                )
                 self._blocked_ips[ip] = {
                     'timestamp': time.time(),
                     'reason': f"Auto-blocked: {reason} (flagged {self._flagged_ips[ip]['count']} times)",
@@ -383,6 +561,10 @@ class DecisionEngine:
 
     def block_ip(self, ip, reason):
         """Manually block an IP address."""
+        if _is_safe_ip(ip):
+            logger.warning("REFUSED manual block of safe IP: %s", ip)
+            return False
+
         with self._lock:
             # If flagged, remove from flags
             if ip in self._flagged_ips:
@@ -473,6 +655,16 @@ class DecisionEngine:
             ]
             for ip in expired_flags:
                 del self._flagged_ips[ip]
+
+            # Trim IP packet counts older entries to prevent unbounded growth
+            # (keep only IPs that are still flagged or blocked)
+            active_ips = set(self._blocked_ips.keys()) | set(self._flagged_ips.keys())
+            stale_ips = [
+                ip for ip in self._ip_packet_counts
+                if ip not in active_ips and self._ip_packet_counts[ip] < 50
+            ]
+            for ip in stale_ips:
+                del self._ip_packet_counts[ip]
 
             self.stats['blocked_ips_count'] = len(self._blocked_ips)
             self.stats['flagged_ips_count'] = len(self._flagged_ips)
