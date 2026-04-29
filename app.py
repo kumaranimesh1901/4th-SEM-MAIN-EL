@@ -61,9 +61,12 @@ def on_packet_captured(pkt_info):
 def on_alert_generated(alert):
     """Callback when an alert is generated."""
     try:
-        socketio.emit('new_alert', alert.to_dict(), namespace='/')
-    except Exception:
-        pass
+        alert_dict = alert.to_dict()
+        print(f"[DEBUG] SOCKETIO EMIT: new_alert → {alert_dict.get('alert_type', '?')} "
+              f"from {alert_dict.get('source_ip', '?')} (severity={alert_dict.get('severity', '?')})")
+        socketio.emit('new_alert', alert_dict, namespace='/')
+    except Exception as e:
+        print(f"[!] SocketIO alert emit error: {e}")
 
 
 def on_firewall_decision(decision):

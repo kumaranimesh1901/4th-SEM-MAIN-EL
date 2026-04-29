@@ -54,11 +54,11 @@ ALERT_HISTORY_SIZE = 500  # Max alerts to keep in memory
 DETECTION_WINDOW = 60  # Time window in seconds for flow analysis
 
 # ── Port Scan Detection (sliding window) ──────────────────────
-PORT_SCAN_UNIQUE_PORTS = 20    # Unique dst ports to trigger alert
-PORT_SCAN_WINDOW_SEC = 5       # Sliding window in seconds
+PORT_SCAN_UNIQUE_PORTS = 10    # Unique dst ports to trigger alert (lowered for demo)
+PORT_SCAN_WINDOW_SEC = 10      # Sliding window in seconds (wider to catch nmap)
 
 # ── Rate-based DDoS / Scan Fallback ───────────────────────────
-RATE_PPS_THRESHOLD = 100       # Packets per second to flag
+RATE_PPS_THRESHOLD = 20        # Packets per second to flag (lowered for demo)
 RATE_WINDOW_SEC = 3            # Sustain window in seconds
 
 # ── Safety Filters ────────────────────────────────────────────
@@ -88,7 +88,7 @@ ATTACK_CLASSES = [
 # ============================================================
 RULES = {
     'port_scan': {
-        'threshold': 15,       # Number of unique ports in time window
+        'threshold': 10,       # Number of unique ports in time window (lowered for demo)
         'time_window': 10,     # Seconds
         'severity': 'high',
     },

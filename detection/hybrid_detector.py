@@ -118,9 +118,10 @@ class HybridDetector:
         3. Update flow
         4. Rule-based detection
         5. ML detection (run on every qualifying flow packet, cache results)
-        6. Decision engine — combine rule + cached ML for same src IP
-        7. Telegram alerts for high severity
-        8. Track normal traffic
+        6. OVERRIDE: If rules fired, force ML result to NOT be 'Normal'
+        7. Decision engine — combine rule + cached ML for same src IP
+        8. Telegram alerts for high severity
+        9. Track normal traffic
         """
         # Step 0: Skip loopback / broadcast only (private LAN IPs are processed)
         if _should_skip_ip(pkt_info.src_ip):
@@ -138,6 +139,10 @@ class HybridDetector:
 
         # Step 4: Rule-based detection
         rule_alerts = self.rule_detector.analyze_packet(pkt_info, flow)
+
+        if rule_alerts:
+            print(f"[DEBUG] PIPELINE: Rule-based detection fired for {pkt_info.src_ip} "
+                  f"→ {[a.alert_type for a in rule_alerts]}")
 
         # Step 5: ML detection
         # Run ML on every 3rd packet of flows with >= 3 packets
@@ -163,7 +168,20 @@ class HybridDetector:
                 else:
                     ml_result = cached['result']
 
-        # Step 6: Decision Engine
+        # Step 6: OVERRIDE — If rule-based detection fired, do NOT let ML
+        # classify the traffic as "Normal". Rule-based alerts take priority.
+        if rule_alerts and ml_result and not ml_result.get('is_attack', False):
+            best_rule = max(rule_alerts, key=lambda a: a.confidence)
+            print(f"[DEBUG] OVERRIDE: ML said Normal but rules detected "
+                  f"'{best_rule.alert_type}' — forcing ML to match rule output")
+            ml_result['is_attack'] = True
+            ml_result['attack_type'] = best_rule.alert_type
+            ml_result['confidence'] = max(ml_result.get('confidence', 0), best_rule.confidence)
+            ml_result['explanations'] = ml_result.get('explanations', []) + [
+                f"Overridden by rule-based detection: {best_rule.alert_type}"
+            ]
+
+        # Step 7: Decision Engine
         if rule_alerts or (ml_result and ml_result.get('is_attack')) or anomaly_result:
             decision = self.decision_engine.make_decision(
                 source_ip=pkt_info.src_ip,
@@ -172,6 +190,9 @@ class HybridDetector:
                 ml_result=ml_result if ml_result else None,
                 anomaly_result=anomaly_result,
             )
+
+            print(f"[DEBUG] DECISION: {decision.action} for {pkt_info.src_ip} "
+                  f"(type={decision.attack_type}, sev={decision.severity})")
 
             # Update stats
             if decision.action == 'BLOCK':
@@ -184,7 +205,7 @@ class HybridDetector:
             else:
                 self.stats['allowed'] += 1
         else:
-            # Step 8: Track normal/clean traffic
+            # Step 9: Track normal/clean traffic
             self._track_normal_traffic(pkt_info)
 
     def _run_ml_prediction(self, flow, pkt_info):

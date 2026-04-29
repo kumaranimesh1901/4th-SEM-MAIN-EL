@@ -128,7 +128,7 @@ class RuleBasedDetector:
 
         # Cooldown to prevent alert flooding
         self._alert_cooldown = {}
-        self._cooldown_seconds = 15
+        self._cooldown_seconds = 5  # Reduced from 15s for faster re-alerting
 
         # ── Rate-based High-Rate Traffic tracker ──────────────
         self._rate_tracker = defaultdict(lambda: deque(maxlen=2000))
@@ -159,15 +159,23 @@ class RuleBasedDetector:
         detections.extend(self._detect_arp_spoofing(pkt_info))
         detections.extend(self._detect_encrypted_anomaly(pkt_info))
 
+        if detections:
+            print(f"[DEBUG] analyze_packet: {len(detections)} detection(s) from {pkt_info.src_ip} "
+                  f"→ types: {[d.alert_type for d in detections]}")
+
         for alert in detections:
             if self._check_cooldown(alert):
                 with self._lock:
                     self.alerts.append(alert)
+                print(f"[DEBUG] Alert stored: #{alert.alert_id} {alert.alert_type} "
+                      f"from {alert.source_ip} (severity={alert.severity}, conf={alert.confidence:.2f})")
                 for callback in self._alert_callbacks:
                     try:
                         callback(alert)
                     except Exception as e:
                         print(f"[!] Alert callback error: {e}")
+            else:
+                print(f"[DEBUG] Alert suppressed by cooldown: {alert.alert_type} from {alert.source_ip}")
 
         return detections
 
@@ -358,8 +366,8 @@ class RuleBasedDetector:
         dst = pkt_info.dst_ip or ''
         port = pkt_info.dst_port
 
-        window = getattr(config, 'PORT_SCAN_WINDOW_SEC', 5)
-        threshold = getattr(config, 'PORT_SCAN_UNIQUE_PORTS', 20)
+        window = getattr(config, 'PORT_SCAN_WINDOW_SEC', 10)
+        threshold = getattr(config, 'PORT_SCAN_UNIQUE_PORTS', 10)
 
         # Record (timestamp, port)
         self._port_scan_times[src].append((now, port))
@@ -372,16 +380,21 @@ class RuleBasedDetector:
         # Collect unique ports within the window
         unique_ports = set(p for _, p in self._port_scan_times[src])
 
-        # Periodic debug log (every 200 packets per src)
+        # ── DEBUG: Print port scan tracking for every packet with dst_port ──
         self._debug_log_counter += 1
-        if self._debug_log_counter % 200 == 0:
-            logger.debug(
-                "port_scan_v2 src=%s unique_ports=%d/%d window=%ds",
-                src, len(unique_ports), threshold, window,
-            )
+        if self._debug_log_counter % 10 == 0:  # Every 10 packets
+            print(f"[DEBUG] PORT_SCAN {src} → ports: {len(unique_ports)}/{threshold} "
+                  f"(window={window}s, total_entries={len(self._port_scan_times[src])})")
 
         if len(unique_ports) >= threshold:
             confidence = min(1.0, len(unique_ports) / (threshold * 2))
+            print(f"\n{'='*60}")
+            print(f"[ALERT] 🚨 PORT SCAN DETECTED from {src}")
+            print(f"[ALERT]    Unique ports: {len(unique_ports)} (threshold: {threshold})")
+            print(f"[ALERT]    Window: {window}s")
+            print(f"[ALERT]    Sample ports: {sorted(list(unique_ports))[:20]}")
+            print(f"{'='*60}\n")
+
             logger.warning(
                 "PORT_SCAN triggered src=%s unique_ports=%d window=%ds",
                 src, len(unique_ports), window,
@@ -425,7 +438,7 @@ class RuleBasedDetector:
 
         now = time.time()
         src = pkt_info.src_ip
-        pps_threshold = getattr(config, 'RATE_PPS_THRESHOLD', 100)
+        pps_threshold = getattr(config, 'RATE_PPS_THRESHOLD', 20)
         sustain_sec = getattr(config, 'RATE_WINDOW_SEC', 3)
 
         self._rate_tracker[src].append(now)
@@ -439,9 +452,16 @@ class RuleBasedDetector:
         elapsed = (now - self._rate_tracker[src][0]) if count > 1 else 0
         pps = count / max(elapsed, 0.1)
 
+        # ── DEBUG: Print rate tracking periodically ──
+        if self._debug_log_counter % 50 == 0 and pps > 5:
+            print(f"[DEBUG] RATE {src} → {pps:.0f} pps (threshold={pps_threshold}, "
+                  f"count={count}, elapsed={elapsed:.1f}s)")
+
         if pps >= pps_threshold:
             if src not in self._rate_sustained_start:
                 self._rate_sustained_start[src] = now
+                print(f"[DEBUG] RATE {src} → exceeded {pps_threshold} pps ({pps:.0f}), "
+                      f"starting sustain timer...")
                 return alerts  # Start tracking, don't alert yet
 
             sustained = now - self._rate_sustained_start[src]
@@ -451,6 +471,13 @@ class RuleBasedDetector:
             # Sustained — generate alert
             del self._rate_sustained_start[src]
             confidence = min(1.0, pps / (pps_threshold * 2))
+
+            print(f"\n{'='*60}")
+            print(f"[ALERT] 🚨 HIGH RATE TRAFFIC from {src}")
+            print(f"[ALERT]    Rate: {pps:.0f} pps (threshold: {pps_threshold})")
+            print(f"[ALERT]    Sustained: {sustained:.0f}s (min: {sustain_sec}s)")
+            print(f"{'='*60}\n")
+
             logger.warning(
                 "RATE_ALERT triggered src=%s pps=%.0f sustained=%.0fs",
                 src, pps, sustained,
