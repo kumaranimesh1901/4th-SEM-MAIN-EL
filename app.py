@@ -84,6 +84,7 @@ hybrid_detector.register_alert_callback(on_alert_generated)
 hybrid_detector.register_decision_callback(on_firewall_decision)
 
 
+
 # ============================================================
 # Routes
 # ============================================================

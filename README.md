@@ -438,6 +438,85 @@ The web dashboard at `http://localhost:5050` provides 6 tabs:
 
 ---
 
+## 🧪 Attacker–Victim Demo Setup
+
+This section explains how to set up a real-world demonstration using two machines to simulate attacks and visualize real-time detection.
+
+### 🎭 Roles
+
+- **Victim Machine**: Runs the NetGuard IDS application (the target).
+- **Attacker Machine**: Generates malicious traffic using tools like Nmap or `ping`.
+
+### 💻 System Requirements
+
+- **Two devices**: (Mac / Linux / Windows)
+- **Network**: Both devices must be on the **same network** (e.g., same Wi-Fi network or a mobile hotspot).
+- **Software (Victim)**: Python installed and NetGuard dependencies configured.
+- **Software (Attacker)**: Nmap installed (for port scanning).
+
+### 📝 Step-by-Step Instructions
+
+#### A. Victim Setup (e.g., Windows)
+
+1. **Navigate to the project directory**:
+   ```bash
+   cd path\to\4th-SEM-MAIN-EL
+   ```
+2. **Activate your virtual environment** (if applicable):
+   ```bash
+   venv\Scripts\activate
+   ```
+3. **Configure the interface**:
+   Update `config.py` to set `CAPTURE_INTERFACE` to your active network adapter (or leave as `None` for auto-detection).
+4. **Run the application**:
+   ```bash
+   python app.py
+   ```
+   *(Ensure you run as Administrator if packet capture requires it).*
+5. **Open the dashboard**:
+   Navigate to `http://localhost:5050` in your web browser. Note your machine's local IP address (e.g., `192.168.1.10`).
+
+#### B. Attacker Setup (e.g., Mac / Linux)
+
+1. **Verify connectivity**:
+   Ping the victim's IP to ensure they are reachable.
+   ```bash
+   ping <victim_ip>
+   ```
+2. **Run an Nmap Port Scan**:
+   Execute a stealth SYN scan targeting the first 1000 ports.
+   ```bash
+   nmap -Pn -sS -T4 -p 1-1000 <victim_ip>
+   ```
+
+### 🎯 Expected Results
+
+On the Victim's NetGuard Dashboard:
+- **Packets Tab**: You will see a rapid increase in captured network traffic.
+- **Alerts Tab**: New alerts will appear, detecting the attack (e.g., flagged as "Port Scan").
+- **Firewall Tab**: The system will log **FLAG** or **BLOCK** decisions against the attacker's IP based on the detection engine.
+
+### 🔍 Optional Verification
+
+- Use **Wireshark** on the Victim machine, listening on the same network interface, to confirm that the packets shown in the NetGuard dashboard match the raw traffic on the wire.
+
+### 🛠 Troubleshooting Demo Issues
+
+- **"Host seems down" during Nmap**: Ensure you use the `-Pn` flag in your Nmap command to skip host discovery. Check Windows Firewall on the victim to ensure it isn't completely dropping ICMP/ping.
+- **No packets in Dashboard**: The two machines are not on the same network, or `CAPTURE_INTERFACE` is set to the wrong adapter.
+- **Packets appear, but no alerts**: The attack traffic might not be hitting the configured detection thresholds. Review `config.py` or `rule_engine.py` settings.
+
+### 🎬 Presentation Demo Script
+
+Use this script for a live 5-step presentation:
+1. **Show the Dashboard**: Present the empty/idle NetGuard dashboard on the Victim machine.
+2. **Launch Attack**: Switch to the Attacker machine and execute the Nmap command.
+3. **Show Live Traffic**: Switch back to the Victim and open the *Packets* tab to show raw traffic flowing in.
+4. **Highlight Detection**: Move to the *Alerts* tab to show the "Port Scan" detection in real-time.
+5. **Show Defense**: Open the *Firewall* tab to demonstrate the attacker's IP being flagged and subsequently blocked.
+
+---
+
 ## Troubleshooting
 
 ### XGBoost import error: `libomp.dylib not found` (macOS)
